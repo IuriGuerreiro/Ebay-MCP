@@ -60,19 +60,24 @@ const searchShape = {
   categoryId: z.string().optional(),
   minPrice: z.number().optional(),
   maxPrice: z.number().optional(),
-  currency: z.string().optional().describe("Default USD"),
+  currency: z.string().optional().describe("Only needed for unknown marketplaces; set automatically per site"),
   conditions: z.array(z.enum(["NEW", "USED", "UNSPECIFIED"])).optional(),
   sellers: z.array(z.string()).optional(),
   sort: z.enum(["price", "-price", "newlyListed", "endingSoonest"]).optional(),
   limit: z.number().int().min(1).max(200).optional(),
   offset: z.number().int().min(0).optional(),
-  marketplace: z.string().optional().describe("e.g. EBAY_US, EBAY_GB, EBAY_DE"),
+  marketplace: z.string().optional().describe("EUROPE (all EU sites), a site like EBAY_DE, or a comma list. Prices are in each site's own currency."),
 };
 
 async function runSearch(args) {
   if (!args.query && !args.categoryId) throw new Error("Provide query or categoryId.");
   const r = await search(args);
-  return { total: r.total ?? 0, offset: r.offset, items: (r.itemSummaries || []).map(summarize) };
+  return {
+    total: r.total ?? 0,
+    offset: r.offset,
+    items: (r.itemSummaries || []).map((it) => ({ ...summarize(it), marketplace: it.marketplace })),
+    errors: r.errors?.length ? r.errors : undefined,
+  };
 }
 
 server.tool(

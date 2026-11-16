@@ -11,7 +11,7 @@ Uses the eBay Browse API with an app token (no user login needed).
    claude mcp add ebay -e EBAY_CLIENT_ID=... -e EBAY_CLIENT_SECRET=... -- node /home/rshazow/Projects/Ebay-MCP/src/index.js
    ```
 
-Optional env: `EBAY_MARKETPLACE_ID` (default `EBAY_US`), `EBAY_ENV=sandbox`.
+Optional env: `EBAY_MARKETPLACE_ID` — `EUROPE` (searches DE, GB, FR, IT, ES, NL, BE, AT, IE, CH, PL at once), one site like `EBAY_DE`, or a comma list. Default `EBAY_US`. Also `EBAY_ENV=sandbox`.
 
 ## Tools
 | Tool | What it does |

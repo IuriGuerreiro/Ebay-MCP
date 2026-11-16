@@ -1,7 +1,23 @@
 // Minimal eBay Browse API client (app token via client credentials).
 const ENV = (process.env.EBAY_ENV || "production").toLowerCase();
 const HOST = ENV === "sandbox" ? "https://api.sandbox.ebay.com" : "https://api.ebay.com";
-const DEFAULT_MARKETPLACE = process.env.EBAY_MARKETPLACE_ID || "EBAY_US";
+const DEFAULT_MARKETPLACE = (process.env.EBAY_MARKETPLACE_ID || "EBAY_US").toUpperCase();
+
+// Currency used by each marketplace (needed for price filters).
+export const CURRENCY = {
+  EBAY_US: "USD", EBAY_GB: "GBP", EBAY_DE: "EUR", EBAY_FR: "EUR", EBAY_IT: "EUR",
+  EBAY_ES: "EUR", EBAY_NL: "EUR", EBAY_BE: "EUR", EBAY_AT: "EUR", EBAY_IE: "EUR",
+  EBAY_CH: "CHF", EBAY_PL: "PLN", EBAY_CA: "CAD", EBAY_AU: "AUD",
+};
+const EUROPE = ["EBAY_DE", "EBAY_GB", "EBAY_FR", "EBAY_IT", "EBAY_ES", "EBAY_NL",
+  "EBAY_BE", "EBAY_AT", "EBAY_IE", "EBAY_CH", "EBAY_PL"];
+
+/** "EUROPE" → all EU sites; "EBAY_DE,EBAY_FR" → those; else one site. */
+export function resolveMarketplaces(m) {
+  const v = (m || DEFAULT_MARKETPLACE).toUpperCase();
+  if (v === "EUROPE" || v === "EU") return EUROPE;
+  return v.split(",").map((x) => x.trim()).filter(Boolean);
+}
 
 let token = null;
 let tokenExpiresAt = 0;
@@ -29,7 +45,8 @@ async function getToken() {
   return token;
 }
 
-async function call(path, params = {}, marketplace = DEFAULT_MARKETPLACE) {
+async function call(path, params = {}, marketplace) {
+  marketplace = resolveMarketplaces(marketplace)[0];
   const url = new URL(HOST + path);
   for (const [k, v] of Object.entries(params)) {
     if (v !== undefined && v !== null && v !== "") url.searchParams.set(k, String(v));
@@ -78,11 +95,39 @@ export async function getItem(ref, marketplace) {
 }
 
 export async function search(opts) {
+  const sites = resolveMarketplaces(opts.marketplace);
+  if (sites.length === 1) return searchOne({ ...opts, marketplace: sites[0] });
+  const results = await Promise.allSettled(sites.map((m) => searchOne({ ...opts, marketplace: m })));
+  const seen = new Set();
+  const items = [];
+  const errors = [];
+  let total = 0;
+  results.forEach((r, i) => {
+    if (r.status === "rejected") return errors.push(`${sites[i]}: ${String(r.reason.message).slice(0, 150)}`);
+    total += r.value.total ?? 0;
+    for (const it of r.value.itemSummaries || []) {
+      if (seen.has(it.itemId)) continue;
+      seen.add(it.itemId);
+      items.push({ ...it, marketplace: sites[i] });
+    }
+  });
+  const price = (it) => parseFloat((it.currentBidPrice || it.price)?.value ?? "Infinity");
+  const sorters = {
+    price: (a, b) => price(a) - price(b),
+    "-price": (a, b) => price(b) - price(a),
+    endingSoonest: (a, b) => new Date(a.itemEndDate || 8e15) - new Date(b.itemEndDate || 8e15),
+    newlyListed: (a, b) => new Date(b.itemCreationDate || 0) - new Date(a.itemCreationDate || 0),
+  };
+  if (sorters[opts.sort]) items.sort(sorters[opts.sort]);
+  return { total, offset: opts.offset ?? 0, itemSummaries: items.slice(0, opts.limit ?? 20), errors };
+}
+
+async function searchOne(opts) {
   const filters = [];
   if (opts.buyingOptions?.length) filters.push(`buyingOptions:{${opts.buyingOptions.join("|")}}`);
   if (opts.minPrice != null || opts.maxPrice != null) {
     filters.push(`price:[${opts.minPrice ?? ""}..${opts.maxPrice ?? ""}]`);
-    filters.push(`priceCurrency:${opts.currency || "USD"}`);
+    filters.push(`priceCurrency:${CURRENCY[opts.marketplace] || opts.currency || "USD"}`);
   }
   if (opts.conditions?.length) filters.push(`conditions:{${opts.conditions.join("|")}}`);
   if (opts.endingWithinHours != null) {

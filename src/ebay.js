@@ -22,8 +22,16 @@ export function resolveMarketplaces(m) {
 let token = null;
 let tokenExpiresAt = 0;
 
-async function getToken() {
-  if (token && Date.now() < tokenExpiresAt - 60_000) return token;
+let pending = null;
+
+// Share one in-flight token request across parallel searches.
+function getToken() {
+  if (token && Date.now() < tokenExpiresAt - 60_000) return Promise.resolve(token);
+  pending ??= fetchToken().finally(() => { pending = null; });
+  return pending;
+}
+
+async function fetchToken() {
   const id = process.env.EBAY_CLIENT_ID;
   const secret = process.env.EBAY_CLIENT_SECRET;
   if (!id || !secret) throw new Error("Set EBAY_CLIENT_ID and EBAY_CLIENT_SECRET.");

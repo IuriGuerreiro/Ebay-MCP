@@ -2,7 +2,11 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { getItem, search } from "./ebay.js";
+import { fileURLToPath } from "node:url";
+
+// Load .env from the project root if present.
+try { process.loadEnvFile(fileURLToPath(new URL("../.env", import.meta.url))); } catch {}
+const { getItem, search } = await import("./ebay.js");
 
 const money = (p) => (p ? `${p.value} ${p.currency}` : null);
 

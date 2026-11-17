@@ -64,7 +64,7 @@ const searchShape = {
   conditions: z.array(z.enum(["NEW", "USED", "UNSPECIFIED"])).optional(),
   sellers: z.array(z.string()).optional(),
   sort: z.enum(["price", "-price", "newlyListed", "endingSoonest"]).optional(),
-  limit: z.number().int().min(1).max(200).optional(),
+  limit: z.number().int().min(1).max(200).optional().describe("Default 20. With EUROPE, total = unique matches across all sites; use offset to page through them (check hasMore)."),
   offset: z.number().int().min(0).optional(),
   marketplace: z.string().optional().describe("EUROPE (all EU sites), a site like EBAY_DE, or a comma list. Prices are in each site's own currency."),
 };
@@ -76,7 +76,9 @@ async function runSearch(args) {
     total: r.total ?? 0,
     offset: r.offset,
     items: (r.itemSummaries || []).map((it) => ({ ...summarize(it), marketplace: it.marketplace })),
+    hasMore: (r.offset ?? 0) + (r.itemSummaries?.length ?? 0) < (r.total ?? 0) || undefined,
     errors: r.errors?.length ? r.errors : undefined,
+    perSite: r.perSite,
   };
 }
 

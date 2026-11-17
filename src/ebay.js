@@ -102,22 +102,64 @@ export async function getItem(ref, marketplace) {
   }
 }
 
+const PAGE = 200;            // eBay max per request
+const MAX_PER_SITE = 1000;  // pages fetched per site in multi-site mode
+
+/** Fetch every page for one site (up to MAX_PER_SITE items). */
+async function searchAllPages(opts) {
+  const first = await searchOne({ ...opts, limit: PAGE, offset: 0 });
+  const items = [...(first.itemSummaries || [])];
+  const total = first.total ?? 0;
+  const want = Math.min(total, MAX_PER_SITE);
+  const offsets = [];
+  for (let o = PAGE; o < want; o += PAGE) offsets.push(o);
+  const pages = await Promise.all(offsets.map((o) => searchOne({ ...opts, limit: PAGE, offset: o })));
+  for (const p of pages) items.push(...(p.itemSummaries || []));
+  return { total, items, truncated: total > MAX_PER_SITE };
+}
+
+// Merged multi-site results are cached briefly so paging with offset doesn't refetch everything.
+const mergedCache = new Map();
+const CACHE_MS = 3 * 60_000;
+
 export async function search(opts) {
   const sites = resolveMarketplaces(opts.marketplace);
   if (sites.length === 1) return searchOne({ ...opts, marketplace: sites[0] });
-  const results = await Promise.allSettled(sites.map((m) => searchOne({ ...opts, marketplace: m })));
+  const { offset = 0, limit = 20, ...rest } = opts;
+  const key = JSON.stringify({ ...rest, sites });
+  let hit = mergedCache.get(key);
+  if (!hit || Date.now() - hit.at > CACHE_MS) {
+    hit = { at: Date.now(), data: searchMerged(rest, sites) };
+    mergedCache.set(key, hit);
+    hit.data.catch(() => mergedCache.delete(key));
+  }
+  const { items, errors, perSite } = await hit.data;
+  return { total: items.length, offset, itemSummaries: items.slice(offset, offset + limit), errors, perSite };
+}
+
+/** Multi-site: fetch all pages per site, merge, dedupe, sort. */
+async function searchMerged(opts, sites) {
+  const results = await Promise.allSettled(sites.map((m) => searchAllPages({ ...opts, marketplace: m })));
   const seen = new Set();
   const items = [];
   const errors = [];
-  let total = 0;
+  const perSite = {};
   results.forEach((r, i) => {
-    if (r.status === "rejected") return errors.push(`${sites[i]}: ${String(r.reason.message).slice(0, 150)}`);
-    total += r.value.total ?? 0;
-    for (const it of r.value.itemSummaries || []) {
+    const site = sites[i];
+    if (r.status === "rejected") {
+      perSite[site] = { error: true };
+      return errors.push(`${site}: ${String(r.reason.message).slice(0, 150)}`);
+    }
+    let added = 0;
+    for (const it of r.value.items) {
       if (seen.has(it.itemId)) continue;
       seen.add(it.itemId);
-      items.push({ ...it, marketplace: sites[i] });
+      items.push({ ...it, marketplace: site });
+      added++;
     }
+    perSite[site] = { matches: r.value.total, fetched: r.value.items.length, newUnique: added,
+      ...(r.value.truncated && { truncated: true }) };
+    if (r.value.truncated) errors.push(`${site}: ${r.value.total} matches, only first ${MAX_PER_SITE} fetched — narrow the query`);
   });
   const price = (it) => parseFloat((it.currentBidPrice || it.price)?.value ?? "Infinity");
   const sorters = {
@@ -127,7 +169,7 @@ export async function search(opts) {
     newlyListed: (a, b) => new Date(b.itemCreationDate || 0) - new Date(a.itemCreationDate || 0),
   };
   if (sorters[opts.sort]) items.sort(sorters[opts.sort]);
-  return { total, offset: opts.offset ?? 0, itemSummaries: items.slice(0, opts.limit ?? 20), errors };
+  return { items, errors, perSite };
 }
 
 async function searchOne(opts) {

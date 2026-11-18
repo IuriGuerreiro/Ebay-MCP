@@ -223,6 +223,9 @@ server.tool(
       }
       const next = offset + items.length;
       return ok({
+        NEXT_PAGE: next < all.length
+          ? `Items ${offset + 1}-${next} of ${all.length}. MORE REMAIN: call scan_deals again with the same queries and offset: ${next}`
+          : `Items ${offset + 1}-${next} of ${all.length}. This is the last page.`,
         scanned, candidates: all.length, offset, returned: items.length,
         nextOffset: next < all.length ? next : undefined,
         columns: "total EUR (original bid + ship) | vs query median | bids | condition | timeLeft | seller% | site | title | url",

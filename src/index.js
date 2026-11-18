@@ -148,12 +148,12 @@ async function eurRates() {
 }
 const toEur = (p, r) => (p && r[p.currency] ? parseFloat(p.value) / r[p.currency] : null);
 
-const NOISE = /\b(h[üu]lle|case|cover|schutz(glas|folie)|panzerglas|screen protector|cable|kabel|charger|ladeger[äa]t|adapter|sticker|skin|box only|nur ovp|leerkarton|custodia|coque|funda|etui|pellicola)\b/i;
+const NOISE = /(h[üu]lle|\bcase\b|cover|schutz|panzerglas|protector|kabel|\bcable|charger|lade(ger[äa]t|kabel)|adapter|sticker|\bskin|etui|tasche|custodi|coque|funda|pellicola|scatol|\bbox only|leerkarton|\bovp only|nur ovp|empty box|\bdisplay\b|\blcd\b|\boled\b|bildschirm|kamera|camera|\bakku|battery|batteri|\btester|\btest board|ersatzteil|spare part|ricambi|flex|backcover|r[üu]ckseite|geh[äa]use|housing|frame|rahmen|keyboard only|tastatur only|\bmanual|anleitung|poster|figur|card\b|sammelkarte|teller|plate|piatto|vase)/i;
 
 server.tool(
   "scan_deals",
   "Run many auction searches across EUROPE in one call. Results are merged, de-duplicated, converted to EUR, " +
-  "filtered (min price, accessory words) and sorted ending soonest. Use this first for deal hunting, then get_listing on candidates.",
+  "filtered (min price, accessory words), then ranked by price vs the median of the same query (cheapest first, top 150). Use this first for deal hunting, then get_listing on candidates.",
   {
     queries: z.array(z.string()).min(1).max(40).describe("Specific phrases, e.g. 'DDR5 32GB', 'PowerEdge', 'iPhone 15 Pro'"),
     endingWithinHours: z.number().optional().describe("Default 24"),
@@ -161,6 +161,9 @@ server.tool(
     maxEur: z.number().optional(),
     excludeAccessories: z.boolean().optional().describe("Default true: drop cases, cables, chargers, empty boxes"),
     marketplace: z.string().optional().describe("Default EUROPE"),
+    maxRatio: z.number().optional().describe("Keep items priced at most this fraction of their query's median (default 0.6). Use 0 to disable ranking and get everything"),
+    minRatio: z.number().optional().describe("Drop items below this fraction of the median (default 0.15; usually junk)"),
+    maxResults: z.number().int().min(1).max(2000).optional().describe("Cap on ranked results (default 150)"),
     limit: z.number().int().min(1).max(200).optional(),
     offset: z.number().int().min(0).optional(),
   },
@@ -172,7 +175,7 @@ server.tool(
         query: q, marketplace: a.marketplace ?? "EUROPE", buyingOptions: ["AUCTION"],
         endingWithinHours: hours, sort: "endingSoonest", limit: 1000,
       })));
-      const seen = new Map(), perQuery = {}, errors = [];
+      const seen = new Map(), perQuery = {}, errors = [], byQuery = {};
       runs.forEach((res, i) => {
         const q = a.queries[i];
         if (res.status === "rejected") { perQuery[q] = "error"; errors.push(`${q}: ${res.reason?.message}`); return; }
@@ -187,18 +190,32 @@ server.tool(
           kept++;
           const prev = seen.get(it.itemId);
           if (prev) { prev.q.add(q); continue; }
-          seen.set(it.itemId, { it, bid, ship, tot, q: new Set([q]) });
+          const d = { it, bid, ship, tot, q: new Set([q]) };
+          seen.set(it.itemId, d); (byQuery[q] ||= []).push(d);
         }
         perQuery[q] = `${res.value.total} matches, ${kept} kept`;
         for (const e of res.value.errors || []) errors.push(`${q}: ${e}`);
       });
-      const all = [...seen.values()].sort((x, y) => new Date(x.it.itemEndDate) - new Date(y.it.itemEndDate));
+      // Rank: price vs the median of the same query (a cheap "below typical" signal).
+      for (const list of Object.values(byQuery)) {
+        const t = list.map((d) => d.tot).sort((x, y) => x - y);
+        const med = t[Math.floor(t.length / 2)];
+        for (const d of list) if (d.median == null || med < d.median) { d.median = med; d.ratio = d.tot / med; }
+      }
+      const maxRatio = a.maxRatio ?? 0.6;
+      let all = [...seen.values()];
+      const scanned = all.length;
+      const minRatio = a.minRatio ?? 0.15; // below this is almost always parts/accessories
+      if (maxRatio > 0) all = all.filter((d) => d.ratio <= maxRatio && d.ratio >= minRatio).sort((x, y) => x.ratio - y.ratio);
+      else all.sort((x, y) => new Date(x.it.itemEndDate) - new Date(y.it.itemEndDate));
+      all = all.slice(0, a.maxResults ?? 150);
       const offset = a.offset ?? 0, limit = a.limit ?? 200;
       const items = []; let size = 0;
       for (const d of all.slice(offset, offset + limit)) {
         const s = summarize(d.it);
         const orig = d.it.currentBidPrice || d.it.price;
         const line = [`€${d.tot.toFixed(0)} (bid ${orig.value} ${orig.currency} + ship €${d.ship.toFixed(0)})`,
+          `${Math.round(d.ratio * 100)}% of median €${d.median.toFixed(0)}`,
           s.bidCount ?? 0, s.condition ?? "?", s.timeLeft, s.seller?.feedbackPercent ?? "?",
           (d.it.marketplace || "").replace("EBAY_", ""), s.title?.slice(0, 90), s.url?.split("?")[0]].join(" | ");
         if (items.length && size + line.length > MAX_CHARS) break;
@@ -206,9 +223,9 @@ server.tool(
       }
       const next = offset + items.length;
       return ok({
-        unique: all.length, offset, returned: items.length,
+        scanned, candidates: all.length, offset, returned: items.length,
         nextOffset: next < all.length ? next : undefined,
-        columns: "total EUR (original bid + ship) | bids | condition | timeLeft | seller% | site | title | url",
+        columns: "total EUR (original bid + ship) | vs query median | bids | condition | timeLeft | seller% | site | title | url",
         items, perQuery, errors: errors.length ? errors.slice(0, 20) : undefined,
         ratesNote: rates.r === FALLBACK_RATES ? "Live rates unavailable; approximate rates used" : undefined,
       });

@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 
 // Load .env from the project root if present.
 try { process.loadEnvFile(fileURLToPath(new URL("../.env", import.meta.url))); } catch {}
-const { getItem, search } = await import("./ebay.js");
+const { getItem, search, SHIP_TO } = await import("./ebay.js");
 
 const money = (p) => (p ? `${p.value} ${p.currency}` : null);
 
@@ -146,6 +146,28 @@ async function eurRates() {
   } catch { rates = { at: Date.now(), r: FALLBACK_RATES }; }
   return rates.r;
 }
+async function mapLimit(list, n, fn) {
+  let i = 0;
+  await Promise.all(Array.from({ length: Math.min(n, list.length) }, async () => { while (i < list.length) await fn(list[i++]); }));
+}
+const shipCache = new Map();
+async function shipInfo(it) {
+  const hit = shipCache.get(it.itemId);
+  if (hit && Date.now() - hit.at < 30 * 60_000) return hit.v;
+  let v = null;
+  try {
+    const d = await getItem(it.itemId, it.marketplace);
+    const inc = (d.shipToLocations?.regionIncluded || []).map((x) => x.regionId);
+    const exc = (d.shipToLocations?.regionExcluded || []).map((x) => x.regionId);
+    const ships = exc.includes(SHIP_TO) ? false
+      : inc.some((x) => x === SHIP_TO || x === "WORLDWIDE" || x === "EUROPE" || x === "EUROPEAN_UNION") ? true
+      : inc.length ? false : null;
+    v = { ships, cost: ships ? d.shippingOptions?.[0]?.shippingCost : null };
+  } catch {}
+  shipCache.set(it.itemId, { at: Date.now(), v });
+  return v;
+}
+const EU = new Set("AT BE BG HR CY CZ DK EE FI FR DE GR HU IE IT LV LT LU MT NL PL PT RO SK SI ES SE".split(" "));
 const toEur = (p, r) => (p && r[p.currency] ? parseFloat(p.value) / r[p.currency] : null);
 
 const NOISE = /(h[üu]lle|\bcase\b|cover|schutz|panzerglas|protector|kabel|\bcable|charger|lade(ger[äa]t|kabel)|adapter|sticker|\bskin|etui|tasche|custodi|coque|funda|pellicola|scatol|\bbox only|leerkarton|\bovp only|nur ovp|empty box|\bdisplay\b|\blcd\b|\boled\b|bildschirm|kamera|camera|\bakku|battery|batteri|\btester|\btest board|ersatzteil|spare part|ricambi|flex|backcover|r[üu]ckseite|geh[äa]use|housing|frame|rahmen|keyboard only|tastatur only|\bmanual|anleitung|poster|figur|card\b|sammelkarte|teller|plate|piatto|vase)/i;
@@ -208,7 +230,24 @@ server.tool(
       const minRatio = a.minRatio ?? 0.15; // below this is almost always parts/accessories
       if (maxRatio > 0) all = all.filter((d) => d.ratio <= maxRatio && d.ratio >= minRatio).sort((x, y) => x.ratio - y.ratio);
       else all.sort((x, y) => new Date(x.it.itemEndDate) - new Date(y.it.itemEndDate));
-      all = all.slice(0, a.maxResults ?? 150);
+      const cap = a.maxResults ?? 150;
+      // Check delivery to EBAY_SHIP_TO (and quote shipping there) for the best-ranked items,
+      // keeping the first `cap` that ship. At most 2×cap detail calls; cached 30 min.
+      let droppedNoShip = 0, checked = 0;
+      if (SHIP_TO) {
+        const pool = all.slice(0, cap * 2), keep = [];
+        for (let i = 0; i < pool.length && keep.length < cap; i += 20) {
+          const batch = pool.slice(i, i + 20);
+          await mapLimit(batch, 10, async (d) => {
+            const det = await shipInfo(d.it);
+            d.shipsTo = det?.ships;
+            if (det?.cost) { d.ship = toEur(det.cost, r) ?? d.ship; d.tot = d.bid + d.ship; }
+          });
+          checked += batch.length;
+          for (const d of batch) d.shipsTo === false ? droppedNoShip++ : keep.push(d);
+        }
+        all = keep.slice(0, cap);
+      } else all = all.slice(0, cap);
       const offset = a.offset ?? 0, limit = a.limit ?? 200;
       const items = []; let size = 0;
       for (const d of all.slice(offset, offset + limit)) {
@@ -217,7 +256,7 @@ server.tool(
         const line = [`€${d.tot.toFixed(0)} (bid ${orig.value} ${orig.currency} + ship €${d.ship.toFixed(0)})`,
           `${Math.round(d.ratio * 100)}% of median €${d.median.toFixed(0)}`,
           s.bidCount ?? 0, s.condition ?? "?", s.timeLeft, s.seller?.feedbackPercent ?? "?",
-          (d.it.marketplace || "").replace("EBAY_", ""), s.title?.slice(0, 90), s.url?.split("?")[0]].join(" | ");
+          `${(d.it.marketplace || "").replace("EBAY_", "")} from ${d.it.itemLocation?.country ?? "?"}${EU.has(d.it.itemLocation?.country) ? "" : " ⚠import"}`, s.title?.slice(0, 90), s.url?.split("?")[0]].join(" | ");
         if (items.length && size + line.length > MAX_CHARS) break;
         items.push(line); size += line.length + 4;
       }
@@ -228,7 +267,9 @@ server.tool(
           : `Items ${offset + 1}-${next} of ${all.length}. This is the last page.`,
         scanned, candidates: all.length, offset, returned: items.length,
         nextOffset: next < all.length ? next : undefined,
-        columns: "total EUR (original bid + ship) | vs query median | bids | condition | timeLeft | seller% | site | title | url",
+        columns: "total EUR (original bid + ship) | vs query median | bids | condition | timeLeft | seller% | site from country (⚠import = outside EU, customs/VAT likely) | title | url",
+        shipping: SHIP_TO ? `Checked per item: all listed ship to ${SHIP_TO}, shipping quoted to ${SHIP_TO}. Checked ${checked}, dropped ${droppedNoShip} that don't ship there.`
+          : "Shipping is the seller's default (set EBAY_SHIP_TO to check delivery).",
         items, perQuery, errors: errors.length ? errors.slice(0, 20) : undefined,
         ratesNote: rates.r === FALLBACK_RATES ? "Live rates unavailable; approximate rates used" : undefined,
       });

@@ -53,7 +53,9 @@ async function fetchToken() {
   return token;
 }
 
-async function call(path, params = {}, marketplace) {
+export const SHIP_TO = process.env.EBAY_SHIP_TO?.toUpperCase();
+
+async function call(path, params = {}, marketplace, shipTo) {
   marketplace = resolveMarketplaces(marketplace)[0];
   const url = new URL(HOST + path);
   for (const [k, v] of Object.entries(params)) {
@@ -63,6 +65,9 @@ async function call(path, params = {}, marketplace) {
     headers: {
       Authorization: `Bearer ${await getToken()}`,
       "X-EBAY-C-MARKETPLACE-ID": marketplace,
+      // Quote shipping to the buyer's country (EBAY_SHIP_TO, e.g. PT; optional EBAY_SHIP_ZIP).
+      ...(shipTo && { "X-EBAY-C-ENDUSERCTX": `contextualLocation=${encodeURIComponent(
+        `country=${shipTo}${process.env.EBAY_SHIP_ZIP ? `,zip=${process.env.EBAY_SHIP_ZIP}` : ""}`)}` }),
       Accept: "application/json",
     },
   });
@@ -83,12 +88,13 @@ export function parseItemRef(ref) {
 
 export async function getItem(ref, marketplace) {
   const { itemId, legacyId } = parseItemRef(ref);
-  if (itemId) return call(`/buy/browse/v1/item/${encodeURIComponent(itemId)}`, {}, marketplace);
+  if (itemId) return call(`/buy/browse/v1/item/${encodeURIComponent(itemId)}`, {}, marketplace, SHIP_TO);
   try {
     return await call(
       "/buy/browse/v1/item/get_item_by_legacy_id",
       { legacy_item_id: legacyId },
       marketplace,
+      SHIP_TO,
     );
   } catch (e) {
     // Multi-variation listings need the group endpoint.

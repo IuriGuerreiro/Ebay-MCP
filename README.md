@@ -13,6 +13,8 @@ Uses the eBay Browse API with an app token (no user login needed).
 
 Optional env: `EBAY_MARKETPLACE_ID` — `EUROPE` (searches DE, GB, FR, IT, ES, NL, BE, AT, IE, CH, PL at once), one site like `EBAY_DE`, or a comma list. Default `EBAY_US`. Also `EBAY_ENV=sandbox`.
 
+`EBAY_SHIP_TO` — your country code (e.g. `PT`). Searches then only return items that ship there and quote shipping to it. Optional `EBAY_SHIP_ZIP` for more exact quotes.
+
 ## Tools
 | Tool | What it does |
 |---|---|

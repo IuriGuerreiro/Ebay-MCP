@@ -50,7 +50,7 @@ function summarize(it) {
 }
 
 const clean = (o) => JSON.parse(JSON.stringify(o)); // drop undefined
-const ok = (data) => ({ content: [{ type: "text", text: JSON.stringify(clean(data), null, 2) }] });
+const ok = (data) => ({ content: [{ type: "text", text: JSON.stringify(clean(data), null, 1) }] });
 const fail = (e) => ({ isError: true, content: [{ type: "text", text: String(e.message || e) }] });
 
 const server = new McpServer({ name: "ebay-mcp", version: "0.1.0" });
@@ -69,13 +69,24 @@ const searchShape = {
   marketplace: z.string().optional().describe("EUROPE (all EU sites), a site like EBAY_DE, or a comma list. Prices are in each site's own currency."),
 };
 
+function row(it) {
+  const s = summarize(it);
+  const url = s.url?.split("?")[0];
+  const price = s.currentBid ? `bid ${s.currentBid}` : s.price ?? "?";
+  const bin = s.currentBid && s.price ? ` (BIN ${s.price})` : "";
+  return [price + bin, s.bidCount ?? "-", s.shipping ?? "?", s.condition ?? "?", s.timeLeft ?? "?",
+    s.seller?.feedbackPercent ?? "?", (it.marketplace || "").replace("EBAY_", ""), s.title, url].join(" | ");
+}
+
 async function runSearch(args) {
   if (!args.query && !args.categoryId) throw new Error("Provide query or categoryId.");
   const r = await search(args);
   return {
     total: r.total ?? 0,
     offset: r.offset,
-    items: (r.itemSummaries || []).map((it) => ({ ...summarize(it), marketplace: it.marketplace })),
+    // One compact line per item keeps 200-item pages small enough for agent tool output.
+    columns: "price | bids | shipping | condition | timeLeft | seller% | site | title | url",
+    items: (r.itemSummaries || []).map(row),
     hasMore: (r.offset ?? 0) + (r.itemSummaries?.length ?? 0) < (r.total ?? 0) || undefined,
     errors: r.errors?.length ? r.errors : undefined,
     perSite: r.perSite,

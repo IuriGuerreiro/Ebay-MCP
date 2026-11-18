@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 
 // Load .env from the project root if present.
 try { process.loadEnvFile(fileURLToPath(new URL("../.env", import.meta.url))); } catch {}
-const { getItem, search, SHIP_TO } = await import("./ebay.js");
+const { getItem, search, SHIP_TO, stats } = await import("./ebay.js");
 
 const money = (p) => (p ? `${p.value} ${p.currency}` : null);
 
@@ -185,6 +185,7 @@ server.tool(
     marketplace: z.string().optional().describe("Default EUROPE"),
     maxRatio: z.number().optional().describe("Keep items priced at most this fraction of their query's median (default 0.6). Use 0 to disable ranking and get everything"),
     minRatio: z.number().optional().describe("Drop items below this fraction of the median (default 0.15; usually junk)"),
+    shipCheck: z.number().int().min(0).max(300).optional().describe("How many top candidates to check for delivery to EBAY_SHIP_TO (default 80; each costs one API call)"),
     maxResults: z.number().int().min(1).max(2000).optional().describe("Cap on ranked results (default 150)"),
     limit: z.number().int().min(1).max(200).optional(),
     offset: z.number().int().min(0).optional(),
@@ -192,10 +193,11 @@ server.tool(
   async (a) => {
     try {
       const r = await eurRates();
+      const calls0 = stats.calls;
       const minEur = a.minEur ?? 30, hours = a.endingWithinHours ?? 24;
       const runs = await Promise.allSettled(a.queries.map((q) => search({
         query: q, marketplace: a.marketplace ?? "EUROPE", buyingOptions: ["AUCTION"],
-        endingWithinHours: hours, sort: "endingSoonest", limit: 1000,
+        endingWithinHours: hours, sort: "endingSoonest", limit: 1000, maxPerSite: 400,
       })));
       const seen = new Map(), perQuery = {}, errors = [], byQuery = {};
       runs.forEach((res, i) => {
@@ -235,7 +237,7 @@ server.tool(
       // keeping the first `cap` that ship. At most 2×cap detail calls; cached 30 min.
       let droppedNoShip = 0, checked = 0;
       if (SHIP_TO) {
-        const pool = all.slice(0, cap * 2), keep = [];
+        const pool = all.slice(0, a.shipCheck ?? 80), keep = [];
         for (let i = 0; i < pool.length && keep.length < cap; i += 20) {
           const batch = pool.slice(i, i + 20);
           await mapLimit(batch, 10, async (d) => {
@@ -246,7 +248,7 @@ server.tool(
           checked += batch.length;
           for (const d of batch) d.shipsTo === false ? droppedNoShip++ : keep.push(d);
         }
-        all = keep.slice(0, cap);
+        all = [...keep, ...all.slice(pool.length).map((d) => ((d.shipsTo = null), d))].slice(0, cap);
       } else all = all.slice(0, cap);
       const offset = a.offset ?? 0, limit = a.limit ?? 200;
       const items = []; let size = 0;
@@ -255,7 +257,7 @@ server.tool(
         const orig = d.it.currentBidPrice || d.it.price;
         const line = [`€${d.tot.toFixed(0)} (bid ${orig.value} ${orig.currency} + ship €${d.ship.toFixed(0)})`,
           `${Math.round(d.ratio * 100)}% of median €${d.median.toFixed(0)}`,
-          s.bidCount ?? 0, s.condition ?? "?", s.timeLeft, s.seller?.feedbackPercent ?? "?",
+          (SHIP_TO && d.shipsTo == null ? "ship? " : "") + (s.bidCount ?? 0), s.condition ?? "?", s.timeLeft, s.seller?.feedbackPercent ?? "?",
           `${(d.it.marketplace || "").replace("EBAY_", "")} from ${d.it.itemLocation?.country ?? "?"}${EU.has(d.it.itemLocation?.country) ? "" : " ⚠import"}`, s.title?.slice(0, 90), s.url?.split("?")[0]].join(" | ");
         if (items.length && size + line.length > MAX_CHARS) break;
         items.push(line); size += line.length + 4;
@@ -265,10 +267,11 @@ server.tool(
         NEXT_PAGE: next < all.length
           ? `Items ${offset + 1}-${next} of ${all.length}. MORE REMAIN: call scan_deals again with the same queries and offset: ${next}`
           : `Items ${offset + 1}-${next} of ${all.length}. This is the last page.`,
+        apiCalls: stats.calls - calls0,
         scanned, candidates: all.length, offset, returned: items.length,
         nextOffset: next < all.length ? next : undefined,
         columns: "total EUR (original bid + ship) | vs query median | bids | condition | timeLeft | seller% | site from country (⚠import = outside EU, customs/VAT likely) | title | url",
-        shipping: SHIP_TO ? `Checked per item: all listed ship to ${SHIP_TO}, shipping quoted to ${SHIP_TO}. Checked ${checked}, dropped ${droppedNoShip} that don't ship there.`
+        shipping: SHIP_TO ? `Top ${checked} checked: dropped ${droppedNoShip} that don't ship to ${SHIP_TO}; shipping for those is quoted to ${SHIP_TO}. Lines marked "ship?" were not checked.`
           : "Shipping is the seller's default (set EBAY_SHIP_TO to check delivery).",
         items, perQuery, errors: errors.length ? errors.slice(0, 20) : undefined,
         ratesNote: rates.r === FALLBACK_RATES ? "Live rates unavailable; approximate rates used" : undefined,

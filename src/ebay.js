@@ -53,9 +53,33 @@ async function fetchToken() {
   return token;
 }
 
+export const stats = { calls: 0, quotaOut: false };
 export const SHIP_TO = process.env.EBAY_SHIP_TO?.toUpperCase();
 
+// At most MAX_INFLIGHT eBay requests at once; retry 429/5xx with backoff.
+const MAX_INFLIGHT = 8;
+let inflight = 0; const waiters = [];
+async function slot() {
+  if (inflight >= MAX_INFLIGHT) await new Promise((r) => waiters.push(r));
+  inflight++;
+}
+function release() { inflight--; waiters.shift()?.(); }
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 async function call(path, params = {}, marketplace, shipTo) {
+  for (let attempt = 0; ; attempt++) {
+    if (stats.quotaOut) throw new Error("eBay daily API quota exhausted (resets 08:00 UTC)");
+    await slot();
+    stats.calls++;
+    let res;
+    try { res = await rawCall(path, params, marketplace, shipTo); } finally { release(); }
+    if (res.retry && attempt < 4) { await sleep(1000 * 2 ** attempt + Math.random() * 500); continue; }
+    if (res.error) throw res.error;
+    return res.data;
+  }
+}
+
+async function rawCall(path, params, marketplace, shipTo) {
   marketplace = resolveMarketplaces(marketplace)[0];
   const url = new URL(HOST + path);
   for (const [k, v] of Object.entries(params)) {
@@ -71,10 +95,16 @@ async function call(path, params = {}, marketplace, shipTo) {
       Accept: "application/json",
     },
   });
-  if (res.status === 204) return {};
+  if (res.status === 204) return { data: {} };
   const body = await res.text();
-  if (!res.ok) throw new Error(`eBay API ${res.status}: ${body}`);
-  return JSON.parse(body);
+  if (res.status === 429 && /Too many requests/.test(body)) {
+    // errorId 2001 is the daily call quota for the app; retrying won't help.
+    stats.quotaOut = true; setTimeout(() => { stats.quotaOut = false; }, 10 * 60_000);
+    return { error: new Error("eBay daily API quota exhausted (resets 08:00 UTC)") };
+  }
+  if (res.status === 429 || res.status >= 500) return { retry: true, error: new Error(`eBay API ${res.status}: ${body.slice(0, 200)}`) };
+  if (!res.ok) return { error: new Error(`eBay API ${res.status}: ${body}`) };
+  return { data: JSON.parse(body) };
 }
 
 /** Accepts a v1|123|0 id, a plain legacy number, or an eBay /itm/ URL. */
@@ -116,12 +146,13 @@ async function searchAllPages(opts) {
   const first = await searchOne({ ...opts, limit: PAGE, offset: 0 });
   const items = [...(first.itemSummaries || [])];
   const total = first.total ?? 0;
-  const want = Math.min(total, MAX_PER_SITE);
+  const cap = opts.maxPerSite ?? MAX_PER_SITE;
+  const want = Math.min(total, cap);
   const offsets = [];
   for (let o = PAGE; o < want; o += PAGE) offsets.push(o);
   const pages = await Promise.all(offsets.map((o) => searchOne({ ...opts, limit: PAGE, offset: o })));
   for (const p of pages) items.push(...(p.itemSummaries || []));
-  return { total, items, truncated: total > MAX_PER_SITE };
+  return { total, items, truncated: total > cap, cap };
 }
 
 // Merged multi-site results are cached briefly so paging with offset doesn't refetch everything.
@@ -165,7 +196,7 @@ async function searchMerged(opts, sites) {
     }
     perSite[site] = { matches: r.value.total, fetched: r.value.items.length, newUnique: added,
       ...(r.value.truncated && { truncated: true }) };
-    if (r.value.truncated) errors.push(`${site}: ${r.value.total} matches, only first ${MAX_PER_SITE} fetched — narrow the query`);
+    if (r.value.truncated) errors.push(`${site}: ${r.value.total} matches, only first ${r.value.cap} fetched — narrow the query`);
   });
   const price = (it) => parseFloat((it.currentBidPrice || it.price)?.value ?? "Infinity");
   const sorters = {

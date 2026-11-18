@@ -66,6 +66,7 @@ const searchShape = {
   sort: z.enum(["price", "-price", "newlyListed", "endingSoonest"]).optional(),
   limit: z.number().int().min(1).max(200).optional().describe("Default 20. With EUROPE, total = unique matches across all sites; use offset = nextOffset to page. Responses are capped at ~8 KB, so fewer items than limit may come back. Use specific queries, minPrice and categoryId to cut accessory noise."),
   offset: z.number().int().min(0).optional(),
+  maxResults: z.number().int().min(1).max(1000).optional().describe("Cap on results you can page through (default 200)"),
   marketplace: z.string().optional().describe("EUROPE (all EU sites), a site like EBAY_DE, or a comma list. Prices are in each site's own currency."),
 };
 
@@ -83,10 +84,12 @@ const MAX_CHARS = 8000; // keep each response well under agent tool-output limit
 async function runSearch(args) {
   if (!args.query && !args.categoryId) throw new Error("Provide query or categoryId.");
   const r = await search(args);
-  const offset = r.offset ?? args.offset ?? 0, total = r.total ?? 0;
+  const offset = r.offset ?? args.offset ?? 0, matches = r.total ?? 0;
+  const cap = args.maxResults ?? 200; // never page past the top `cap` results
+  const total = Math.min(matches, cap);
   const items = [];
   let size = 0;
-  for (const it of r.itemSummaries || []) {
+  for (const it of (r.itemSummaries || []).slice(0, Math.max(0, total - offset))) {
     const line = row(it);
     if (items.length && size + line.length > MAX_CHARS) break;
     items.push(line); size += line.length + 4;
@@ -95,7 +98,8 @@ async function runSearch(args) {
   const perSite = r.perSite && Object.fromEntries(Object.entries(r.perSite).map(([k, v]) =>
     [k.replace("EBAY_", ""), v.error ? "error" : `${v.matches}${v.truncated ? " (truncated)" : ""}`]));
   return {
-    total, offset, returned: items.length,
+    total, matches: matches > total ? matches : undefined, offset, returned: items.length,
+    note: matches > total ? `Showing top ${total} of ${matches} matches. Use a more specific query or minPrice to see others.` : undefined,
     nextOffset: next < total ? next : undefined, // call again with offset = nextOffset
     columns: "price | bids | shipping | condition | timeLeft | seller% | site | title | url",
     items,

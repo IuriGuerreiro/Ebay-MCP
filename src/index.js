@@ -197,7 +197,7 @@ server.tool(
       const minEur = a.minEur ?? 30, hours = a.endingWithinHours ?? 24;
       const runs = await Promise.allSettled(a.queries.map((q) => search({
         query: q, marketplace: a.marketplace ?? "EUROPE", buyingOptions: ["AUCTION"],
-        endingWithinHours: hours, sort: "endingSoonest", limit: 1000, maxPerSite: 400,
+        endingWithinHours: hours, sort: "endingSoonest", limit: 1000, maxPerSite: 150,
       })));
       const seen = new Map(), perQuery = {}, errors = [], byQuery = {};
       runs.forEach((res, i) => {

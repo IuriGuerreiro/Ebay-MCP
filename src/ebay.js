@@ -143,7 +143,7 @@ const MAX_PER_SITE = 1000;  // pages fetched per site in multi-site mode
 
 /** Fetch every page for one site (up to MAX_PER_SITE items). */
 async function searchAllPages(opts) {
-  const first = await searchOne({ ...opts, limit: PAGE, offset: 0 });
+  const first = await searchOne({ ...opts, limit: Math.min(PAGE, opts.maxPerSite ?? PAGE), offset: 0 });
   const items = [...(first.itemSummaries || [])];
   const total = first.total ?? 0;
   const cap = opts.maxPerSite ?? MAX_PER_SITE;

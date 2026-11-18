@@ -134,6 +134,88 @@ server.tool(
   },
 );
 
+// ---- scan_deals: many queries at once, merged, in EUR, noise filtered ----
+const FALLBACK_RATES = { EUR: 1, GBP: 0.85, CHF: 0.94, PLN: 4.3 }; // units per 1 EUR
+let rates = null;
+async function eurRates() {
+  if (rates && Date.now() - rates.at < 6 * 3600_000) return rates.r;
+  try {
+    const res = await fetch("https://api.frankfurter.app/latest?from=EUR", { signal: AbortSignal.timeout(5000) });
+    const j = await res.json();
+    rates = { at: Date.now(), r: { EUR: 1, ...j.rates } };
+  } catch { rates = { at: Date.now(), r: FALLBACK_RATES }; }
+  return rates.r;
+}
+const toEur = (p, r) => (p && r[p.currency] ? parseFloat(p.value) / r[p.currency] : null);
+
+const NOISE = /\b(h[üu]lle|case|cover|schutz(glas|folie)|panzerglas|screen protector|cable|kabel|charger|ladeger[äa]t|adapter|sticker|skin|box only|nur ovp|leerkarton|custodia|coque|funda|etui|pellicola)\b/i;
+
+server.tool(
+  "scan_deals",
+  "Run many auction searches across EUROPE in one call. Results are merged, de-duplicated, converted to EUR, " +
+  "filtered (min price, accessory words) and sorted ending soonest. Use this first for deal hunting, then get_listing on candidates.",
+  {
+    queries: z.array(z.string()).min(1).max(40).describe("Specific phrases, e.g. 'DDR5 32GB', 'PowerEdge', 'iPhone 15 Pro'"),
+    endingWithinHours: z.number().optional().describe("Default 24"),
+    minEur: z.number().optional().describe("Drop items whose bid+shipping is below this (default 30)"),
+    maxEur: z.number().optional(),
+    excludeAccessories: z.boolean().optional().describe("Default true: drop cases, cables, chargers, empty boxes"),
+    marketplace: z.string().optional().describe("Default EUROPE"),
+    limit: z.number().int().min(1).max(200).optional(),
+    offset: z.number().int().min(0).optional(),
+  },
+  async (a) => {
+    try {
+      const r = await eurRates();
+      const minEur = a.minEur ?? 30, hours = a.endingWithinHours ?? 24;
+      const runs = await Promise.allSettled(a.queries.map((q) => search({
+        query: q, marketplace: a.marketplace ?? "EUROPE", buyingOptions: ["AUCTION"],
+        endingWithinHours: hours, sort: "endingSoonest", limit: 1000,
+      })));
+      const seen = new Map(), perQuery = {}, errors = [];
+      runs.forEach((res, i) => {
+        const q = a.queries[i];
+        if (res.status === "rejected") { perQuery[q] = "error"; errors.push(`${q}: ${res.reason?.message}`); return; }
+        let kept = 0;
+        for (const it of res.value.itemSummaries || []) {
+          const bid = toEur(it.currentBidPrice || it.price, r);
+          const ship = toEur(it.shippingOptions?.[0]?.shippingCost, r) ?? 0;
+          if (bid == null) continue;
+          const tot = bid + ship;
+          if (tot < minEur || (a.maxEur != null && tot > a.maxEur)) continue;
+          if (a.excludeAccessories !== false && NOISE.test(it.title || "")) continue;
+          kept++;
+          const prev = seen.get(it.itemId);
+          if (prev) { prev.q.add(q); continue; }
+          seen.set(it.itemId, { it, bid, ship, tot, q: new Set([q]) });
+        }
+        perQuery[q] = `${res.value.total} matches, ${kept} kept`;
+        for (const e of res.value.errors || []) errors.push(`${q}: ${e}`);
+      });
+      const all = [...seen.values()].sort((x, y) => new Date(x.it.itemEndDate) - new Date(y.it.itemEndDate));
+      const offset = a.offset ?? 0, limit = a.limit ?? 200;
+      const items = []; let size = 0;
+      for (const d of all.slice(offset, offset + limit)) {
+        const s = summarize(d.it);
+        const orig = d.it.currentBidPrice || d.it.price;
+        const line = [`€${d.tot.toFixed(0)} (bid ${orig.value} ${orig.currency} + ship €${d.ship.toFixed(0)})`,
+          s.bidCount ?? 0, s.condition ?? "?", s.timeLeft, s.seller?.feedbackPercent ?? "?",
+          (d.it.marketplace || "").replace("EBAY_", ""), s.title?.slice(0, 90), s.url?.split("?")[0]].join(" | ");
+        if (items.length && size + line.length > MAX_CHARS) break;
+        items.push(line); size += line.length + 4;
+      }
+      const next = offset + items.length;
+      return ok({
+        unique: all.length, offset, returned: items.length,
+        nextOffset: next < all.length ? next : undefined,
+        columns: "total EUR (original bid + ship) | bids | condition | timeLeft | seller% | site | title | url",
+        items, perQuery, errors: errors.length ? errors.slice(0, 20) : undefined,
+        ratesNote: rates.r === FALLBACK_RATES ? "Live rates unavailable; approximate rates used" : undefined,
+      });
+    } catch (e) { return fail(e); }
+  },
+);
+
 server.tool(
   "get_listing",
   "Full details for one listing. Accepts an eBay URL, legacy item number, or v1|…|0 item id.",
